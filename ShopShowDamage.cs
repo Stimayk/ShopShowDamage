@@ -1,91 +1,149 @@
 using CounterStrikeSharp.API.Core;
-using Newtonsoft.Json.Linq;
+using CounterStrikeSharp.API.Core.Attributes.Registration;
 using ShopAPI;
+using System.Collections.Concurrent;
+using Timer = CounterStrikeSharp.API.Modules.Timers.Timer;
 
 namespace ShopShowDamage
 {
-    public class ShopShowDamage : BasePlugin
+    public class ShopShowDamage : BasePlugin, IPluginConfig<ShopShowDamageConfig>
     {
         public override string ModuleName => "[SHOP] Show Damage";
         public override string ModuleDescription => "";
         public override string ModuleAuthor => "E!N";
-        public override string ModuleVersion => "v1.0.0";
+        public override string ModuleVersion => "v1.1.0";
 
         private IShopApi? SHOP_API;
         private const string CategoryName = "ShowDamage";
-        public static JObject? JsonShowDamage { get; private set; }
         private readonly PlayerShowDamage[] playerShowDamages = new PlayerShowDamage[65];
+        private readonly ConcurrentDictionary<CCSPlayerController, string> messages = new();
+        private readonly ConcurrentDictionary<CCSPlayerController, Timer> deleteTimers = new();
+
+        public ShopShowDamageConfig Config { get; set; } = new();
+
+        public void OnConfigParsed(ShopShowDamageConfig config)
+        {
+            Config = config;
+        }
 
         public override void OnAllPluginsLoaded(bool hotReload)
         {
             SHOP_API = IShopApi.Capability.Get();
             if (SHOP_API == null) return;
 
-            LoadConfig();
+            RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
+            RegisterListener<Listeners.OnTick>(ShowDamageMessages);
+
             InitializeShopItems();
-            SetupTimersAndListeners();
         }
 
-        private void LoadConfig()
+        public override void Unload(bool hotReload)
         {
-            string configPath = Path.Combine(ModuleDirectory, "../../configs/plugins/Shop/ShowDamage.json");
-            if (File.Exists(configPath))
+            foreach (var timer in deleteTimers.Values)
             {
-                JsonShowDamage = JObject.Parse(File.ReadAllText(configPath));
+                timer.Kill();
             }
+            deleteTimers.Clear();
+            messages.Clear();
+
+            DeregisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
+            RemoveListener<Listeners.OnTick>(ShowDamageMessages);
+            UnloadingShopItems();
         }
 
         private void InitializeShopItems()
         {
-            if (JsonShowDamage == null || SHOP_API == null) return;
+            if (Config.ItemName == null || SHOP_API == null) return;
 
             SHOP_API.CreateCategory(CategoryName, "Отображение урона");
 
-            foreach (var item in JsonShowDamage.Properties().Where(p => p.Value is JObject))
+            Task.Run(async () =>
             {
-                Task.Run(async () =>
+                int itemId = await SHOP_API.AddItem(
+                    Config.ItemName,
+                    Config.Name!,
+                    CategoryName,
+                    Config.Price!,
+                    Config.SellPrice!,
+                    Config.Duration!
+                );
+                SHOP_API.SetItemCallbacks(itemId, OnClientBuyItem, OnClientSellItem, OnClientToggleItem);
+            }).Wait();
+        }
+
+        private void UnloadingShopItems()
+        {
+            if (Config.ItemName == null || SHOP_API == null) return;
+
+            SHOP_API.UnregisterCategory(CategoryName, true);
+        }
+
+        [GameEventHandler()]
+        public HookResult OnPlayerHurt(EventPlayerHurt @event, GameEventInfo info)
+        {
+            var attacker = @event.Attacker;
+            var userid = @event.Userid;
+
+            if (attacker == null || !attacker.IsValid || attacker.IsBot || attacker == userid ||
+            (attacker.TeamNum == (userid?.TeamNum ?? 0)) || (playerShowDamages[attacker.Slot] == null))
+            {
+                return HookResult.Continue;
+            }
+
+            var dmgHealth = @event.DmgHealth;
+            var health = @event.Health;
+            var hudMessage = Localizer["HUD", dmgHealth, userid?.PlayerName ?? "Unknown", health];
+
+            ManageTimerAndMessage(attacker, hudMessage);
+
+            return HookResult.Continue;
+        }
+
+        private void ManageTimerAndMessage(CCSPlayerController attacker, string hudMessage)
+        {
+            if (deleteTimers.TryRemove(attacker, out var timer))
+            {
+                timer.Kill();
+            }
+
+            messages[attacker] = hudMessage;
+            var newTimer = new Timer(Config.NotifyDuration, () =>
+            {
+                if (messages.TryRemove(attacker, out _) && deleteTimers.TryRemove(attacker, out var removeTimer))
                 {
-                    int itemId = await SHOP_API.AddItem(
-                        item.Name,
-                        (string)item.Value["name"]!,
-                        CategoryName,
-                        (int)item.Value["price"]!,
-                        (int)item.Value["sellprice"]!,
-                        (int)item.Value["duration"]!
-                    );
-                    SHOP_API.SetItemCallbacks(itemId, OnClientBuyItem, OnClientSellItem, OnClientToggleItem);
-                }).Wait();
+                    removeTimer?.Kill();
+                }
+            });
+
+            deleteTimers[attacker] = newTimer;
+        }
+
+        private void ShowDamageMessages()
+        {
+            foreach (var entry in messages)
+            {
+                PrintHtml(entry.Key, entry.Value);
             }
         }
 
-        private void SetupTimersAndListeners()
+        private static void PrintHtml(CCSPlayerController player, string hudContent)
         {
-            RegisterListener<Listeners.OnClientDisconnect>(playerSlot => playerShowDamages[playerSlot] = null!);
-
-            RegisterEventHandler<EventPlayerHurt>((@event, info) =>
+            var eventShowSurvivalRespawnStatus = new EventShowSurvivalRespawnStatus(false)
             {
-                var attacker = @event.Attacker;
-                if (attacker != null)
-                {
-                    if (!attacker.IsValid) return HookResult.Continue;
-                    if (attacker.PlayerName == @event.Userid?.PlayerName) return HookResult.Continue;
-
-                    if (playerShowDamages[attacker.Slot] != null)
-                    {
-                        attacker.PrintToCenterHtml($" Нанесён урон: <font color='red'>{@event.DmgHealth}HP</font>");
-                    }
-                }
-                return HookResult.Continue;
-            });
+                LocToken = hudContent,
+                Duration = 5L,
+                Userid = player
+            };
+            eventShowSurvivalRespawnStatus.FireEvent(false);
         }
 
-        public void OnClientBuyItem(CCSPlayerController player, int itemId, string categoryName, string uniqueName,
-            int buyPrice, int sellPrice, int duration, int count)
+        public HookResult OnClientBuyItem(CCSPlayerController player, int itemId, string categoryName, string uniqueName, int buyPrice, int sellPrice, int duration, int count)
         {
             playerShowDamages[player.Slot] = new PlayerShowDamage(itemId);
+            return HookResult.Continue;
         }
 
-        public void OnClientToggleItem(CCSPlayerController player, int itemId, string uniqueName, int state)
+        public HookResult OnClientToggleItem(CCSPlayerController player, int itemId, string uniqueName, int state)
         {
             if (state == 1)
             {
@@ -95,11 +153,13 @@ namespace ShopShowDamage
             {
                 OnClientSellItem(player, itemId, uniqueName, 0);
             }
+            return HookResult.Continue;
         }
 
-        public void OnClientSellItem(CCSPlayerController player, int itemId, string uniqueName, int sellPrice)
+        public HookResult OnClientSellItem(CCSPlayerController player, int itemId, string uniqueName, int sellPrice)
         {
             playerShowDamages[player.Slot] = null!;
+            return HookResult.Continue;
         }
 
         public record class PlayerShowDamage(int ItemID);
